@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -27,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	acmetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/tools/events"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,9 +67,10 @@ type RestoreActiveCommitReconciler struct {
 // ChangeTransferPolicy, makes the policy the owner of this RestoreActiveCommit, and restores the policy's
 // active branch to spec.sha exactly once. A successful status (status.restoredFrom == spec.sha) is
 // not repeated, so a later promotion is not overwritten when this resource is reconciled again. A
-// spec.sha that carries Promoter-restored-from is refused. A spec.sha the active tip already
-// restores is also refused once that tip's note carries Promoter-restore-unblocked-at; the note is
-// not rewritten. status.blockedDrySha is the dry SHA that was on the active branch; the
+// spec.sha that carries Promoter-restored-from is refused. When the active tip already restores
+// spec.sha and its note carries Promoter-restore-unblocked-at, this object deletes itself and
+// leaves that note unchanged, so it does not stay pending and block promotion. status.blockedDrySha
+// is the dry SHA that was on the active branch; the
 // ChangeTransferPolicy does not open a pull request that would put it
 // back while the restore commit's note lacks Promoter-restore-unblocked-at. A pull request for a different
 // proposed dry SHA may open, but nothing is auto-merged until that trailer is written. Setting
@@ -126,7 +127,7 @@ func (r *RestoreActiveCommitReconciler) Reconcile(ctx context.Context, req ctrl.
 		return r.unblockAndSelfDelete(ctx, &rc)
 	}
 
-	scmProvider, secret, gitRepo, err := utils.GetScmProviderSecretAndGitRepositoryFromRepositoryReference(ctx, r.Client, r.SettingsMgr.GetControllerNamespace(), ctp.Spec.RepositoryReference, ctp)
+	scmProvider, secret, gitRepo, err := utils.GetScmProviderSecretAndGitRepositoryFromRepositoryReference(ctx, r.Client, r.SettingsMgr, ctp.Spec.RepositoryReference, ctp)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get ScmProvider and secret for repo %q: %w", ctp.Spec.RepositoryReference.Name, err)
 	}
@@ -151,6 +152,13 @@ func (r *RestoreActiveCommitReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	restored, err := gitOperations.RestoreActiveBranch(ctx, ctp.Spec.ActiveBranch, ctp.Spec.ActivePath, rc.Spec.Sha)
 	if err != nil {
+		var released *git.RestoreAlreadyReleasedError
+		if errors.As(err, &released) {
+			// The tip was unblocked before this object recorded a restore. Deleting it (while
+			// spec.blockEnvironment is still true) leaves the existing stamp in place. A pending
+			// object would block promotion even though the note already released the gate.
+			return r.deleteAlreadyReleased(ctx, &rc, released.ActiveTip)
+		}
 		return ctrl.Result{}, fmt.Errorf("failed to restore %q to %q: %w", ctp.Spec.ActiveBranch, rc.Spec.Sha, err)
 	}
 
@@ -166,6 +174,19 @@ func (r *RestoreActiveCommitReconciler) Reconcile(ctx context.Context, req ctrl.
 	// blockEnvironment false deletes on the next pass, after this status is stored, so the
 	// finalizer observes activeSha and stamps the note before the object disappears.
 	return r.requeueResult(ctx)
+}
+
+// deleteAlreadyReleased removes a RestoreActiveCommit whose target is already the active tip and
+// whose note already carries Promoter-restore-unblocked-at. spec.blockEnvironment is still true, so
+// the finalizer does not write the note again. The existing stamp stays.
+func (r *RestoreActiveCommitReconciler) deleteAlreadyReleased(ctx context.Context, rc *promoterv1alpha1.RestoreActiveCommit, activeTip string) (ctrl.Result, error) {
+	log.FromContext(ctx).Info("Active tip already carries Promoter-restore-unblocked-at; deleting RestoreActiveCommit",
+		"activeTip", activeTip, "sha", rc.Spec.Sha)
+	r.Recorder.Eventf(rc, nil, "Normal", constants.RestoreAlreadyReleasedReason, "Deleting", constants.RestoreAlreadyReleasedMessage, rc.Name, activeTip)
+	if err := r.Delete(ctx, rc); err != nil && !k8s_errors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to delete RestoreActiveCommit for already-unblocked tip %q: %w", activeTip, err)
+	}
+	return ctrl.Result{}, nil
 }
 
 // unblockAndSelfDelete stamps Promoter-restore-unblocked-at then deletes the RestoreActiveCommit.
@@ -191,18 +212,20 @@ func (r *RestoreActiveCommitReconciler) handleFinalizer(ctx context.Context, rc 
 	finalizer := promoterv1alpha1.RestoreActiveCommitFinalizer
 
 	if rc.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(rc, finalizer) {
+		if !controllerutil.AddFinalizer(rc, finalizer) {
+			// Already has the finalizer.
 			return false, nil
 		}
-		return false, retry.RetryOnConflict(retry.DefaultRetry, func() error { //nolint:wrapcheck // RetryOnConflict returns wrapped error
-			if err := r.Get(ctx, client.ObjectKeyFromObject(rc), rc); err != nil {
-				return err //nolint:wrapcheck // error will be wrapped by caller
-			}
-			if controllerutil.AddFinalizer(rc, finalizer) {
-				return r.Update(ctx, rc) //nolint:wrapcheck // RetryOnConflict returns wrapped error
-			}
-			return nil
-		})
+
+		// A single attempt, not a Get-retry loop: on conflict Reconcile returns the error and the
+		// standard workqueue rate limiter retries with a fresh top-level Get on the next Reconcile
+		// call. Re-Getting here would overwrite rc -- including status.conditions, which Reconcile
+		// already reset via RemoveReadyCondition -- with whatever was last persisted, silently
+		// reintroducing a stale Ready condition from an earlier failed reconcile.
+		if err := r.Update(ctx, rc); err != nil {
+			return false, fmt.Errorf("failed to add finalizer: %w", err)
+		}
+		return false, nil
 	}
 
 	if !controllerutil.ContainsFinalizer(rc, finalizer) {
@@ -215,16 +238,11 @@ func (r *RestoreActiveCommitReconciler) handleFinalizer(ctx context.Context, rc 
 		}
 	}
 
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error { //nolint:wrapcheck // RetryOnConflict returns wrapped error
-		if err := r.Get(ctx, client.ObjectKeyFromObject(rc), rc); err != nil {
-			return err //nolint:wrapcheck // error will be wrapped by caller
+	// A single attempt, not a Get-retry loop: see the add-finalizer path above.
+	if controllerutil.RemoveFinalizer(rc, finalizer) {
+		if err := r.Update(ctx, rc); err != nil {
+			return true, fmt.Errorf("failed to remove finalizer: %w", err)
 		}
-		if controllerutil.RemoveFinalizer(rc, finalizer) {
-			return r.Update(ctx, rc) //nolint:wrapcheck // error will be wrapped by caller
-		}
-		return nil
-	}); err != nil {
-		return true, fmt.Errorf("failed to remove finalizer: %w", err)
 	}
 	return true, nil
 }
@@ -248,7 +266,7 @@ func (r *RestoreActiveCommitReconciler) unblockRestoreOnDelete(ctx context.Conte
 		return fmt.Errorf("failed to resolve ChangeTransferPolicy for unblock: %w", err)
 	}
 
-	scmProvider, secret, gitRepo, err := utils.GetScmProviderSecretAndGitRepositoryFromRepositoryReference(ctx, r.Client, r.SettingsMgr.GetControllerNamespace(), ctp.Spec.RepositoryReference, ctp)
+	scmProvider, secret, gitRepo, err := utils.GetScmProviderSecretAndGitRepositoryFromRepositoryReference(ctx, r.Client, r.SettingsMgr, ctp.Spec.RepositoryReference, ctp)
 	if err != nil {
 		return fmt.Errorf("failed to get ScmProvider and secret for repo %q: %w", ctp.Spec.RepositoryReference.Name, err)
 	}
@@ -384,9 +402,6 @@ func (r *RestoreActiveCommitReconciler) SetupWithManager(ctx context.Context, mg
 			// stamps Promoter-restore-unblocked-at when spec.blockEnvironment is false.
 			predicate.Funcs{
 				UpdateFunc: func(e event.UpdateEvent) bool {
-					if e.ObjectOld == nil || e.ObjectNew == nil {
-						return false
-					}
 					return e.ObjectOld.GetDeletionTimestamp().IsZero() && !e.ObjectNew.GetDeletionTimestamp().IsZero()
 				},
 			},

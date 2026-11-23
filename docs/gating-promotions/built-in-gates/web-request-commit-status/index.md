@@ -170,7 +170,7 @@ The `success.when.expression` is evaluated **every reconcile**, regardless of wh
 | `Phase` | string | Phase from the previous reconcile (`"success"`, `"pending"`, or `"failure"`). Per-environment in `environments` context; aggregate of all branches in `promotionstrategy` context. |
 | `PromotionStrategy` | PromotionStrategy | The full PromotionStrategy spec and status. Use `find(PromotionStrategy.Status.Environments, {.Branch == Branch})` to access per-environment data (e.g. `.Proposed.Hydrated.Sha`). |
 | `WebRequestCommitStatus` | WebRequestCommitStatus | The full WebRequestCommitStatus spec and status (snapshot from the previous reconcile). Access per-branch status via `Status.Environments` or `Status.PromotionStrategyContext`. |
-| `NamespaceMetadata` | object | Labels and annotations of the WebRequestCommitStatus's namespace: `NamespaceMetadata.Labels` and `NamespaceMetadata.Annotations` (`map[string]string`). Same binding as Go templates. |
+| `NamespaceMetadata` | object | Labels and annotations of the WebRequestCommitStatus's namespace: `NamespaceMetadata.Labels` and `NamespaceMetadata.Annotations` (`map[string]string`). Same binding as Go templates. Empty when `ControllerConfiguration.spec.webRequestCommitStatus.namespaceMetadata` is `Disabled`. |
 | `TriggerOutput` | map[string]any | Custom data from the previous `when.output.expression` evaluation (trigger mode only). |
 | `ResponseOutput` | map[string]any | Response data from the previous HTTP request's `response.output.expression` (trigger mode only). |
 | `SuccessOutput` | map[string]any | Custom data from the previous `success.when.output.expression` evaluation. |
@@ -339,7 +339,7 @@ spec:
 How it works:
 
 - `success.when.variables` is the single source of truth: it computes `tag`, `runId`, and `ok` once per reconcile.
-- On **fire** reconciles (HTTP response present), it reads from `Response.Body`. On **carry-forward** reconciles (`Response == nil`), it returns last reconcile's `SuccessOutput` verbatim — so the description/URL stay stable and `ok` is preserved without a separate `Phase == "success"` check.
+- On **fire** reconciles (HTTP response present), it reads from `Response.Body`. On **carry-forward** reconciles (`Response == nil`), it returns last reconcile's `SuccessOutput` verbatim — so the description/URL stay stable and `ok` is preserved without a separate `Phase == "success"` check. In polling mode with `reportOn: proposed`, a reconcile for a SHA that already succeeded skips the request and is also a carry-forward reconcile.
 - The boolean `expression: 'Variables.ok'` reuses the same value — no duplicate `Response != nil ? ... : ...` ladder.
 - `output: 'Variables'` persists the whole map to `SuccessOutput`, which is what the next carry-forward reconcile reads back as `prev`.
 - `descriptionTemplate` / `urlTemplate` reference the same map via `.SuccessVariables.tag` and `.SuccessVariables.runId`.
@@ -495,6 +495,8 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: api-token-secret
+  labels:
+    promoter.argoproj.io/webrequestcommitstatus-access: allowed
 type: Opaque
 stringData:
   token: "your-bearer-token-here"
@@ -685,6 +687,8 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: compliance-api-creds
+  labels:
+    promoter.argoproj.io/webrequestcommitstatus-access: allowed
 type: Opaque
 stringData:
   username: "service-account"
@@ -725,6 +729,8 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: oauth-credentials
+  labels:
+    promoter.argoproj.io/webrequestcommitstatus-access: allowed
 type: Opaque
 stringData:
   clientID: "your-client-id"
@@ -763,12 +769,51 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: mtls-client-cert
+  labels:
+    promoter.argoproj.io/webrequestcommitstatus-access: allowed
 type: kubernetes.io/tls
 data:
   tls.crt: <base64-encoded-certificate>
   tls.key: <base64-encoded-private-key>
   ca.crt: <base64-encoded-ca-cert>  # Optional, for custom CA
 ```
+
+### Opting Secrets in with a label
+
+The controller sends the credentials from a `basic`, `bearer`, `oauth2`, or `tls` `secretRef` to the request URL
+you template (for `oauth2`, also to `tokenURL`). Because a WebRequestCommitStatus author chooses that URL, the
+controller only reads a referenced Secret that carries the label `promoter.argoproj.io/webrequestcommitstatus-access: allowed`.
+Without it the reconcile fails with a `Ready=False` condition naming the label, and no request is made.
+
+The label is the only check. The controller does not check whether the WebRequestCommitStatus author can read the
+Secret. Adding the label is an explicit grant by someone who can write the Secret: any user who can create a
+WebRequestCommitStatus in the Secret's namespace can then reference it and have its credentials sent to a URL they
+choose. Only label a Secret if everyone with WebRequestCommitStatus create access in that namespace may use its
+credentials.
+
+A WebRequestCommitStatus can only reference Secrets in its own namespace. To limit who can use a labeled Secret,
+restrict WebRequestCommitStatus create permissions in that namespace, or keep the Secret in a namespace where only
+trusted users can create WebRequestCommitStatuses.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deployments-api-token
+  labels:
+    promoter.argoproj.io/webrequestcommitstatus-access: allowed
+type: Opaque
+stringData:
+  token: your-api-token
+```
+
+Label an existing Secret in place:
+
+```bash
+kubectl label secret deployments-api-token promoter.argoproj.io/webrequestcommitstatus-access=allowed
+```
+
+`authentication.scm` does not use this label: it uses the ScmProvider's Secret and is limited to the provider's host.
 
 ### SCM Provider Credentials
 
@@ -779,6 +824,8 @@ Instead of creating separate secrets, you can reuse the SCM provider credentials
 - You want to avoid duplicating secrets
 
 Set `authentication.scm: {}` and the controller will use the credentials from the ScmProvider referenced by the PromotionStrategy's repository. The authentication method is applied automatically based on the SCM provider type (GitHub App, GitLab token, Azure DevOps PAT, etc.).
+
+Because the SCM credentials travel with the request, the rendered URL must point at the SCM provider's host (the provider's `domain`, or the vendor's API host when none is set), and the controller only follows a redirect whose target stays on that host. A redirect to any other host, or from `https` to plain `http`, fails the request with a `Ready=False` condition instead of forwarding the credentials.
 
 
 **Example — Gate on GitHub branch protection rules being satisfied:**

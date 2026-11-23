@@ -137,6 +137,11 @@ func (r *TimedCommitStatusReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *TimedCommitStatusReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+	// CleanupOrphanedCommitStatuses lists CommitStatuses by their controller owner.
+	if err := utils.RegisterControllerOwnerUIDFieldIndex(ctx, mgr.GetFieldIndexer(), &promoterv1alpha1.CommitStatus{}); err != nil {
+		return fmt.Errorf("TimedCommitStatus controller: %w", err)
+	}
+
 	// Use Direct methods to read configuration from the API server without cache during setup.
 	// The cache is not started during SetupWithManager, so we must use the non-cached API reader.
 	rateLimiter, err := settings.GetRateLimiterDirect[promoterv1alpha1.TimedCommitStatusConfiguration, ctrl.Request](ctx, r.SettingsMgr)
@@ -176,10 +181,8 @@ func (r *TimedCommitStatusReconciler) processEnvironments(ctx context.Context, t
 	commitStatuses := make([]*promoterv1alpha1.CommitStatus, 0, len(tcs.Spec.Environments))
 
 	// Save the previous status before clearing it, so we can detect transitions
-	previousStatus := tcs.Status.DeepCopy()
-	if previousStatus == nil {
-		previousStatus = &promoterv1alpha1.TimedCommitStatusStatus{}
-	}
+	var previousStatus promoterv1alpha1.TimedCommitStatusStatus
+	tcs.Status.DeepCopyInto(&previousStatus)
 
 	// Build a map of environments from PromotionStrategy for efficient lookup
 	envStatusMap := make(map[string]*promoterv1alpha1.EnvironmentStatus, len(ps.Status.Environments))

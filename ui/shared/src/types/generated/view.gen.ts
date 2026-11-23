@@ -113,6 +113,13 @@ export type components = {
              */
             project: string;
         };
+        /** @description AzureWorkloadIdentity configures Azure workload identity authentication for Azure DevOps. Only supported on ClusterScmProvider. */
+        AzureWorkloadIdentity: {
+            /** @description ClientID is the client ID of the Microsoft Entra application or user-assigned managed identity to authenticate as. Defaults to the AZURE_CLIENT_ID environment variable of the controller. */
+            clientID?: string;
+            /** @description TenantID is the Microsoft Entra tenant ID of the identity. Defaults to the AZURE_TENANT_ID environment variable of the controller. */
+            tenantID?: string;
+        };
         /**
          * @description BasicAuth defines HTTP Basic Authentication.
          *
@@ -146,7 +153,10 @@ export type components = {
             secretRef: components["schemas"]["LocalObjectReference"];
         };
         /** @description BitbucketCloud is a Bitbucket Cloud SCM provider configuration. It is used to configure the Bitbucket Cloud settings. */
-        BitbucketCloud: Record<string, never>;
+        BitbucketCloud: {
+            /** @description Domain overrides the Bitbucket Cloud host, for example to reach Bitbucket Cloud through a proxy or a Bitbucket Cloud compatible test server. When set, API requests are sent to https://<domain>/2.0 and git and web URLs use https://<domain>. If using Bitbucket Cloud directly, leave this field empty. */
+            domain?: string;
+        };
         /** @description BitbucketCloudRepo is a repository in Bitbucket Cloud, identified by its owner and name. */
         BitbucketCloudRepo: {
             /**
@@ -159,6 +169,27 @@ export type components = {
              * @default
              */
             owner: string;
+        };
+        /** @description BitbucketDataCenter is a Bitbucket DataCenter/Server SCM provider configuration. */
+        BitbucketDataCenter: {
+            /**
+             * @description Domain is the Bitbucket DataCenter/Server domain, such as "bitbucket.mycompany.com".
+             * @default
+             */
+            domain: string;
+        };
+        /** @description BitbucketDataCenterRepo is a repository in Bitbucket DataCenter/Server, identified by its project key and repository slug. */
+        BitbucketDataCenterRepo: {
+            /**
+             * @description Name is the repository slug (e.g. "my-repo").
+             * @default
+             */
+            name: string;
+            /**
+             * @description Project is the Bitbucket project key (e.g. "MYPROJ").
+             * @default
+             */
+            project: string;
         };
         /** @description ChangeRequestPolicyCommitStatusPhase defines the phase of a commit status in a ChangeTransferPolicy. */
         ChangeRequestPolicyCommitStatusPhase: {
@@ -292,6 +323,18 @@ export type components = {
             /** @description PullRequest is the state of the pull request that was created for this ChangeTransferPolicy. */
             pullRequest?: components["schemas"]["PullRequestCommonStatus"];
         };
+        /** @description ClusterAzureDevOps is the Azure DevOps configuration of a ClusterScmProvider. It extends AzureDevOps with authentication that is only safe on a cluster-scoped resource, which only cluster admins can create. */
+        ClusterAzureDevOps: {
+            /** @description Domain is the Azure DevOps domain, such as "dev.azure.com". If using the default Azure DevOps domain, leave this field empty. */
+            domain?: string;
+            /**
+             * @description Organization is the Azure DevOps organization name.
+             * @default
+             */
+            organization: string;
+            /** @description WorkloadIdentity enables Azure workload identity (Microsoft Entra ID) authentication instead of a Personal Access Token. The controller pod must be configured for Azure workload identity, which projects a federated service account token and sets the AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_FEDERATED_TOKEN_FILE environment variables. When set, secretRef must be omitted. */
+            workloadIdentity?: components["schemas"]["AzureWorkloadIdentity"];
+        };
         /** @description ClusterScmProvider is the Schema for the clusterscmproviders API. */
         ClusterScmProvider: {
             /** @description APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources */
@@ -301,9 +344,30 @@ export type components = {
             /** @default {} */
             metadata?: components["schemas"]["ObjectMeta"];
             /** @default {} */
-            spec?: components["schemas"]["ScmProviderSpec"];
+            spec?: components["schemas"]["ClusterScmProviderSpec"];
             /** @default {} */
             status?: components["schemas"]["ScmProviderStatus"];
+        };
+        /** @description ClusterScmProviderSpec defines the desired state of ClusterScmProvider. It matches ScmProviderSpec except that azureDevOps also accepts settings that are only safe on a cluster-scoped resource, which only cluster admins can create. */
+        ClusterScmProviderSpec: {
+            /** @description AzureDevOps required configuration for Azure DevOps as the SCM provider */
+            azureDevOps?: components["schemas"]["ClusterAzureDevOps"];
+            /** @description BitbucketCloud required configuration for Bitbucket Cloud as the SCM provider */
+            bitbucketCloud?: components["schemas"]["BitbucketCloud"];
+            /** @description BitbucketDataCenter required configuration for Bitbucket DataCenter/Server as the SCM provider */
+            bitbucketDataCenter?: components["schemas"]["BitbucketDataCenter"];
+            /** @description Fake required configuration for Fake as the SCM provider */
+            fake?: components["schemas"]["Fake"];
+            /** @description Forgejo required configuration for Forgejo as the SCM provider */
+            forgejo?: components["schemas"]["Forgejo"];
+            /** @description Gitea required configuration for Gitea as the SCM provider */
+            gitea?: components["schemas"]["Gitea"];
+            /** @description GitHub required configuration for GitHub as the SCM provider */
+            github?: components["schemas"]["GitHub"];
+            /** @description GitLab required configuration for GitLab as the SCM provider */
+            gitlab?: components["schemas"]["GitLab"];
+            /** @description SecretRef contains the credentials required to auth to a specific provider */
+            secretRef?: components["schemas"]["LocalObjectReference"];
         };
         /** @description CommitBranchState defines the state of a branch in a ChangeTransferPolicy. */
         CommitBranchState: {
@@ -878,6 +942,7 @@ export type components = {
         GitRepositorySpec: {
             azureDevOps?: components["schemas"]["AzureDevOpsRepo"];
             bitbucketCloud?: components["schemas"]["BitbucketCloudRepo"];
+            bitbucketDataCenter?: components["schemas"]["BitbucketDataCenterRepo"];
             fake?: components["schemas"]["FakeRepo"];
             forgejo?: components["schemas"]["ForgejoRepo"];
             gitea?: components["schemas"]["GiteaRepo"];
@@ -1066,11 +1131,11 @@ export type components = {
         /** @description History describes a particular change that was promoted into an environment's active branch. */
         History: {
             /**
-             * @description Active is the state of the active branch at the time the PR was merged. Its dry state is read back from <activePath>/hydrator.metadata on the merge commit and its hydrated state from that commit itself, so both describe what actually merged regardless of merge style. Its commitStatuses, by contrast, come from the snapshot trailers and may be stale when mergeCommitSnapshotMismatch is true.
+             * @description Active is the state of the active branch after the PR merged. Its dry state is read back from <activePath>/hydrator.metadata on the merge commit and its hydrated state from that commit itself, so both describe what actually merged regardless of merge style. Its commitStatuses are the active commit statuses last recorded for that commit, taken from the snapshot trailers of the commit that replaced it; they are empty for the current active commit, whose live statuses are on the ChangeTransferPolicy.
              * @default {}
              */
             active?: components["schemas"]["CommitBranchState"];
-            /** @description MergeCommitSnapshotMismatch indicates hydrator metadata on the SCM-reported merge commit disagreed with the promoter's last snapshot (typically an external merge after the proposed branch advanced). When true, the fields this entry rebuilds from the snapshot trailers — proposed.commitStatuses and active.commitStatuses, plus proposed.hydrated when the merge was a squash (a single-parent squash commit gives the controller nothing to reconstruct the hydrated sha from) — may describe the earlier proposed revision rather than what actually merged. */
+            /** @description MergeCommitSnapshotMismatch indicates hydrator metadata on the SCM-reported merge commit disagreed with the promoter's last snapshot (typically an external merge after the proposed branch advanced). When true, the fields this entry rebuilds from its snapshot trailers — proposed.commitStatuses, plus proposed.hydrated when the merge was a squash (a single-parent squash commit gives the controller nothing to reconstruct the hydrated sha from) — may describe the earlier proposed revision rather than what actually merged. */
             mergeCommitSnapshotMismatch?: boolean;
             /**
              * @description Proposed is the state of the proposed branch at the time the PR was merged.
@@ -1081,7 +1146,7 @@ export type components = {
             pullRequest?: components["schemas"]["PullRequestCommonStatus"];
             /** @description RestoreUnblockedAt is set on a restore entry once spec.blockEnvironment is false and the controller has stamped Promoter-restore-unblocked-at on the restore commit's promotion-history note (RFC 3339). While restoredFrom is set and this field is empty, auto-merge is blocked and the dry SHA the restore moved off of is blocked from opening a pull request. */
             restoreUnblockedAt?: components["schemas"]["Time"];
-            /** @description RestoredFrom is set when this entry describes a manual restore of the active branch rather than a merged pull request. Its value is the hydrated SHA the branch was restored to. A restore reuses that version's tree, so active.dry repeats an earlier entry's dry SHA; this field is what distinguishes the two. The pull request and commit status fields, including pullRequest.prMergeTime, are copied from the restored version and describe the original promotion, not the restore. active.hydrated is the restore commit itself, so active.hydrated.commitTime is when the restore was written. */
+            /** @description RestoredFrom is set when this entry describes a manual restore of the active branch rather than a merged pull request. Its value is the hydrated SHA the branch was restored to. A restore reuses that version's tree, so active.dry repeats an earlier entry's dry SHA; this field is what distinguishes the two. The pull request and proposed commit status fields, including pullRequest.prMergeTime, are copied from the restored version and describe the original promotion, not the restore. active.hydrated is the restore commit itself, so active.hydrated.commitTime is when the restore was written. */
             restoredFrom?: string;
         };
         /** @description HydratorMetadata contains metadata about the hydrated commit. This is extracted from the git note or metadata file. */
@@ -1613,7 +1678,7 @@ export type components = {
              */
             promotionStrategyRef: components["schemas"]["io_argoproj_promoter_v1alpha1_ObjectReference"];
             /**
-             * @description Sha is the hydrated commit to restore onto the active branch. It must already be in the active branch's history (the tip or one of its ancestors); any other commit is refused. A commit that carries Promoter-restored-from is itself a restore and is refused. Once the active tip already restores this sha and its note carries Promoter-restore-unblocked-at, another RestoreActiveCommit for the same sha is refused until the active branch moves, and that note is left unchanged. The controller writes a new commit (the commit's tree, or only activePath when the policy sets one) parented on the current active tip and records a promotion-history note with Promoter-restored-from. When the active branch already has that content, nothing is written. The proposed branch is left as the hydrator wrote it. The ChangeTransferPolicy does not open a promotion pull request that would put the active branch's dry SHA back. A pull request for a different proposed dry SHA may open, but nothing is auto-merged while this RestoreActiveCommit exists. Deleting it lifts that block but does not by itself propose the blocked dry SHA again; see status.blockedDrySha. The restore runs once. Later promotions are left alone.
+             * @description Sha is the hydrated commit to restore onto the active branch. It must already be in the active branch's history (the tip or one of its ancestors); any other commit is refused. A commit that carries Promoter-restored-from is itself a restore and is refused. Once the active tip already restores this sha and its note carries Promoter-restore-unblocked-at, another RestoreActiveCommit for the same sha deletes itself without writing a commit or changing that note, so it does not stay and block promotion. Otherwise the controller writes a new commit (the commit's tree, or only activePath when the policy sets one) parented on the current active tip and records a promotion-history note with Promoter-restored-from. When the active branch already has that content, nothing is written. The proposed branch is left as the hydrator wrote it. The ChangeTransferPolicy does not open a promotion pull request that would put the active branch's dry SHA back. A pull request for a different proposed dry SHA may open, but nothing is auto-merged while this RestoreActiveCommit exists. Deleting it lifts that block but does not by itself propose the blocked dry SHA again; see status.blockedDrySha. The restore runs once. Later promotions are left alone.
              * @default
              */
             sha: string;
@@ -1787,6 +1852,8 @@ export type components = {
             azureDevOps?: components["schemas"]["AzureDevOps"];
             /** @description BitbucketCloud required configuration for Bitbucket Cloud as the SCM provider */
             bitbucketCloud?: components["schemas"]["BitbucketCloud"];
+            /** @description BitbucketDataCenter required configuration for Bitbucket DataCenter/Server as the SCM provider */
+            bitbucketDataCenter?: components["schemas"]["BitbucketDataCenter"];
             /** @description Fake required configuration for Fake as the SCM provider */
             fake?: components["schemas"]["Fake"];
             /** @description Forgejo required configuration for Forgejo as the SCM provider */
@@ -2114,6 +2181,8 @@ export type components = {
              *     Additional template variables (not in HTTPRequestSpec):
              *       - {{ index .TriggerVariables "key" }}: result of trigger.when.variables.expression this reconcile (nil if not configured)
              *       - {{ index .SuccessVariables "key" }}: result of success.when.variables.expression this reconcile (nil if not configured)
+             *
+             *     In polling mode with reportOn: proposed, a reconcile for a SHA that already succeeded skips the HTTP request and evaluates success.when.variables.expression with Response nil. Guard reads of Response with Response != nil and fall back to SuccessOutput, so .SuccessVariables keeps the values from the request. A fixed fallback value replaces them, and an expression that fails without a Response leaves .SuccessVariables unset.
              *
              *     Examples: "External approval for {{ .Branch }}", "{{ .Phase }} - waiting for external approval".
              *

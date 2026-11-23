@@ -20,13 +20,13 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.2"
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24.22.0'
+          node-version: '24.22.3'
           cache: 'npm'
           cache-dependency-path: |
             ui/shared/package-lock.json
@@ -43,7 +43,7 @@ jobs:
       - name: UI Checks
         run: make lint-ui
       - name: Set up Python and venv for docs
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
       - name: Create venv and install MkDocs requirements
@@ -54,7 +54,17 @@ jobs:
       - name: Lint Docs
         run: . .venv/bin/activate && make lint-docs
       - name: Get dependencies
-        run: go mod download
+        run: |
+          for attempt in 1 2 3; do
+            if go mod download; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "go mod download failed; retrying in 5 seconds (attempt $((attempt + 1))/3)"
+              sleep 5
+            fi
+          done
+          exit 1
       - name: Restore build output from cache
         id: cache-build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -70,15 +80,32 @@ jobs:
           fi
           echo "ui/web/static directory exists ✓"
       - name: Build
+        id: build
         if: steps.cache-build.outputs.cache-hit != 'true'
         run: make
-      - name: Frontend Extension Unit Tests
+      # The test steps below run even when an earlier check or test step failed, so every suite
+      # still reports its results and coverage to Codecov. Only a failed Build skips them.
+      - name: Frontend shared unit tests
+        if: ${{ !cancelled() && steps.build.outcome != 'failure' }}
+        run: make test-ui-test-shared
+      - name: Frontend components-lib unit tests
+        if: ${{ !cancelled() && steps.build.outcome != 'failure' }}
+        run: make test-ui-test-components-lib
+      - name: Frontend extension unit tests
+        if: ${{ !cancelled() && steps.build.outcome != 'failure' }}
         run: make test-unit-test-extension
-      - name: Frontend Dashboard Unit Tests
+      - name: Frontend dashboard unit tests
+        if: ${{ !cancelled() && steps.build.outcome != 'failure' }}
         run: make test-ui-test-dashboard
       - name: Run Integration Tests
+        if: ${{ !cancelled() && steps.build.outcome != 'failure' }}
         run: make test-parallel
+        env:
+          # 2% of reconciler writes to the envtest API server fail with a synthetic 500. Reads, watches,
+          # and lease writes are exempt. See internal/k8sfault.
+          K8S_FAULT_PROBABILITY: "0.02"
       - name: Fuzz replay (seeds f.Add + testdata/fuzz corpus; no exploratory fuzz)
+        if: ${{ !cancelled() && steps.build.outcome != 'failure' }}
         run: make fuzz-replay
       - name: Generate code coverage artifacts
         if: ${{ !cancelled() }}
@@ -87,23 +114,63 @@ jobs:
           name: code-coverage
           path: |
             cover.out
+            ui/shared/coverage/lcov.info
+            ui/components-lib/coverage/lcov.info
             ui/dashboard/coverage/lcov.info
             ui/extension/coverage/lcov.info
-      - name: Upload code coverage information to codecov.io
+      - name: Upload Go coverage to codecov.io
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          # cover.out: Ginkgo (after make test-parallel). UI: Vitest lcov (repo-root SF: via lcov projectRoot).
-          files: cover.out,ui/dashboard/coverage/lcov.info,ui/extension/coverage/lcov.info
+          # Ginkgo profile from make test-parallel. disable_search keeps this upload from also
+          # picking up the Vitest lcov files, which go up under the ui flag.
+          files: cover.out
+          flags: integration
+          name: integration
+          disable_search: true
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-      - name: Upload test results to codecov.io
+      - name: Upload UI coverage to codecov.io
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
+          # Vitest lcov (repo-root SF: via lcov projectRoot). One flag for the whole UI upload:
+          # Codecov applies a flag to every file in that upload, so a second flag here would
+          # duplicate the same hits.
+          files: ui/shared/coverage/lcov.info,ui/components-lib/coverage/lcov.info,ui/dashboard/coverage/lcov.info,ui/extension/coverage/lcov.info
+          flags: ui
+          name: ui
+          disable_search: true
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Upload Go test results to codecov.io
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          # Ginkgo JUnit report from make test-parallel.
           report_type: test_results
-          token: ${{ secrets.CODECOV_TOKEN }}
+          files: junit.xml
+          flags: integration
+          name: integration
+          disable_search: true
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Upload UI test results to codecov.io
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          # Vitest JUnit reports (reporters in each vitest.config).
+          report_type: test_results
+          files: ui/shared/junit.xml,ui/components-lib/junit.xml,ui/dashboard/junit.xml,ui/extension/junit.xml
+          flags: ui
+          name: ui
+          disable_search: true
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -112,7 +179,7 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.2"
       - name: Lint
@@ -130,7 +197,7 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.2"
       - name: go mod tidy
@@ -187,7 +254,7 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.2"
       - name: Run Nilaway
@@ -200,7 +267,7 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.2"
       - name: Run deadcode

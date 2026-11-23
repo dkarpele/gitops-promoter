@@ -32,10 +32,87 @@ that one tenant's resources do not reference another tenant's resources within t
 If there are no trust boundaries to be enforced among PromotionStrategy users, a GitOps Promoter admin may choose to 
 host all resources in a single namespace, keeping in mind the need to avoid resource name collisions.
 
+## Install modes
+
+By default, GitOps Promoter watches all namespaces and requires a `ClusterRole`. To run it with a namespace-scoped
+`Role` instead, configure these `ControllerConfiguration` fields:
+
+| Field | Values | Description |
+| --- | --- | --- |
+| `spec.scope` | `Cluster` (default), `Namespace` | Which namespaces are watched. `Namespace` watches only the install namespace. |
+| `spec.clusterScmProvider.mode` | `Enabled` (default), `Disabled` | Whether `ClusterScmProvider` resources can be used. |
+| `spec.webRequestCommitStatus.namespaceMetadata` | `Enabled` (default), `Disabled` | Whether `NamespaceMetadata` is available to WebRequestCommitStatus templates and expressions. When disabled, it is empty. |
+
+Restart the controller after changing `spec.scope` or `spec.clusterScmProvider.mode`.
+
+### Cluster (default)
+
+Watches all namespaces. Requires a `ClusterRole`.
+
+```yaml
+spec:
+  scope: Cluster
+  clusterScmProvider:
+    mode: Enabled
+  webRequestCommitStatus:
+    namespaceMetadata: Enabled
+```
+
+### Namespaced with cluster resources
+
+Watches only the install namespace, but keeps `ClusterScmProvider` and `NamespaceMetadata` support. Requires a `Role`
+in the install namespace, plus a `ClusterRole` to read `clusterscmproviders` and `namespaces`.
+
+```yaml
+spec:
+  scope: Namespace
+  clusterScmProvider:
+    mode: Enabled
+  webRequestCommitStatus:
+    namespaceMetadata: Enabled
+```
+
+### Fully isolated
+
+Watches only the install namespace and uses no cluster-scoped promoter resources. The controller's reconcile permissions are a `Role` in the install namespace.
+
+```yaml
+spec:
+  scope: Namespace
+  clusterScmProvider:
+    mode: Disabled
+  webRequestCommitStatus:
+    namespaceMetadata: Disabled
+```
+
+The `-namespaced` release bundles use this mode. See [Installation](../getting-started.md#namespaced).
+
+### Limitations of namespaced modes
+
+* Only resources in the install namespace are reconciled, including CommitStatuses. PromotionStrategies cannot be gated
+  by CommitStatuses in other namespaces (see [CommitStatus Tenancy](#commitstatus-tenancy)).
+* CRDs are cluster-scoped and must still be installed by a cluster administrator.
+* The dashboard API is registered cluster-wide, and only one can be installed per cluster. Each `-namespaced` bundle
+  binds `system:auth-delegator` to the apiserver ServiceAccount, a `RoleBinding` in `kube-system` for
+  `extension-apiserver-authentication-reader`, and the metrics proxy `ClusterRole` to the controller.
+* Namespaced installs do not include built-in serving-cert rotation. That rotator needs
+  `promoter-apiserver-cert-rotation`, a `ClusterRole` with `get`, `list`, and `watch` on `APIService` and `update` on
+  `v1alpha1.view.promoter.argoproj.io`, so the controller can inject `caBundle`. Use the cert-manager or bring-your-own
+  namespaced bundle. The cluster-wide `install-with-dashboard.yaml` bundle is the one that includes the built-in rotator.
+
 ## CommitStatus Tenancy
 
 As with PromotionStrategies, all references from CommitStatuses (to GitRepositories, then ScmProviders, and finally to
 SCM Secrets) must resolve within the same namespace as the CommitStatus.
+
+WebRequestCommitStatus `httpRequest.authentication` secretRefs (`basic`, `bearer`, `oauth2`, `tls`) send the Secret's
+credentials to a URL the WebRequestCommitStatus author controls, so the controller only reads Secrets labeled
+`promoter.argoproj.io/webrequestcommitstatus-access: allowed`. The controller does not check whether the WebRequestCommitStatus
+author can read the Secret, so labeling a Secret lets anyone who can create a WebRequestCommitStatus in that
+namespace use its credentials. Treat the label as an explicit grant by the Secret's writer to all of those users.
+A WebRequestCommitStatus can only reference Secrets in its own namespace, so restricting WebRequestCommitStatus create
+permissions in a namespace limits who can use its labeled Secrets. See
+[Opting Secrets in with a label](../gating-promotions/built-in-gates/web-request-commit-status/index.md#opting-secrets-in-with-a-label).
 
 Various actors may want to manage CommitStatuses:
 

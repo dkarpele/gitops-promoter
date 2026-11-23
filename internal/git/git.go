@@ -736,6 +736,16 @@ func gitChildEnv(user, token string, extraEnv []string) []string {
 	return append(env, extraEnv...)
 }
 
+// gitHTTPHeaderEnv sets http.<urlPrefix>.extraHeader through git's env-based config, which keeps the header out
+// of the process arguments.
+func gitHTTPHeaderEnv(urlPrefix, header string) []string {
+	return []string{
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http." + urlPrefix + ".extraHeader",
+		"GIT_CONFIG_VALUE_0=" + header,
+	}
+}
+
 // runCmdWithEnv runs a git command, appending extraEnv to the standard auth environment, and
 // returns stdout, stderr, and error.
 func runCmdWithEnv(ctx context.Context, gap scms.GitOperationsProvider, directory string, extraEnv []string, args ...string) (string, string, error) {
@@ -756,8 +766,19 @@ func runCmdWithEnvAndStdin(ctx context.Context, gap scms.GitOperationsProvider, 
 		return "", "", fmt.Errorf("failed to get token: %w", err)
 	}
 
+	env := gitChildEnv(user, token, extraEnv)
+	if headerProvider, ok := gap.(scms.GitHTTPHeaderProvider); ok {
+		urlPrefix, header, err := headerProvider.GetGitHTTPHeader(ctx)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to get git HTTP header: %w", err)
+		}
+		if header != "" {
+			env = append(env, gitHTTPHeaderEnv(urlPrefix, header)...)
+		}
+	}
+
 	cmd := gitCommandContext(ctx, args...)
-	cmd.Env = gitChildEnv(user, token, extraEnv)
+	cmd.Env = env
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -1106,6 +1127,11 @@ func (g *EnvironmentOperations) FetchNotes(ctx context.Context) error {
 		remoteSha := remote[ref]
 		if remoteSha == "" {
 			logger.V(4).Info("Git notes ref does not exist on remote", "ref", ref)
+			if local[ref] != "" {
+				if err := g.deleteLocalNotesRef(ctx, ref); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if local[ref] == remoteSha {
@@ -1138,7 +1164,7 @@ func (g *EnvironmentOperations) fetchNotesRef(ctx context.Context, ref string) e
 		if strings.Contains(stderr, "couldn't find remote ref") {
 			metrics.RecordGitOperation(g.gitRepo, metrics.GitOperationFetchNotes, metrics.GitOperationResultSuccess, time.Since(start))
 			logger.V(4).Info("Git notes ref does not exist on remote", "ref", ref)
-			return nil
+			return g.deleteLocalNotesRef(ctx, ref)
 		}
 		metrics.RecordGitOperation(g.gitRepo, metrics.GitOperationFetchNotes, metrics.GitOperationResultFailure, time.Since(start))
 		logger.Error(err, "Failed to fetch git notes", "stderr", stderr)
@@ -1147,6 +1173,23 @@ func (g *EnvironmentOperations) fetchNotesRef(ctx context.Context, ref string) e
 	metrics.RecordGitOperation(g.gitRepo, metrics.GitOperationFetchNotes, metrics.GitOperationResultSuccess, time.Since(start))
 
 	logger.V(4).Info("Fetched git notes", "ref", ref)
+	return nil
+}
+
+// deleteLocalNotesRef drops a notes ref that does not exist on the remote. A note added locally whose push
+// failed would otherwise outlive the failure, and GetHistoryNote would report it as written. Deleting a
+// ref that is already absent succeeds.
+//
+// Read-only with respect to the clone's index/worktree/HEAD.
+func (g *EnvironmentOperations) deleteLocalNotesRef(ctx context.Context, ref string) error {
+	_, stderr, err := g.runCmd(ctx, g.ClonePath(), "update-ref", "-d", ref)
+	g.forgetLocalRef(ref)
+	if ref == PromoterHistoryNotesRef {
+		clear(g.historyNotes)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete local notes ref %q: %w (stderr: %s)", ref, err, stderr)
+	}
 	return nil
 }
 
@@ -1552,8 +1595,10 @@ type RestoreResult struct {
 // A repeat call is a no-op when the active tip already has the restore marker for targetSha and
 // the matching tree and its note does not carry Promoter-restore-unblocked-at. That is the same
 // restore retrying after the commit was already pushed. When that note does carry the trailer, a
-// previous RestoreActiveCommit set spec.blockEnvironment to false: the call is refused and the note is left as it is, so
-// the unblock stays in history. The branch has not moved, so there is no new commit to gate on.
+// previous RestoreActiveCommit set spec.blockEnvironment to false: the call returns
+// RestoreAlreadyReleasedError and the note is left as it is, so the unblock stays in history. The
+// branch has not moved, so there is no new commit to gate on. The RestoreActiveCommit controller
+// deletes the object on that error.
 // When the active tip already has the matching tree without the restore marker, the branch is
 // running that version already: nothing is written, nothing moved off the branch, and the result
 // is Unchanged with an empty BlockedDrySha. Blocking the live dry SHA there would hold back the
@@ -1916,7 +1961,21 @@ func (g *EnvironmentOperations) refuseReleasedRestore(ctx context.Context, activ
 	if len(note[constants.TrailerRestoreUnblockedAt]) == 0 {
 		return nil
 	}
-	return fmt.Errorf("active tip %q already restores %q and carries %s; it cannot be restored again until the active branch moves", activeTip, targetSha, constants.TrailerRestoreUnblockedAt)
+	return &RestoreAlreadyReleasedError{ActiveTip: activeTip, TargetSha: targetSha}
+}
+
+// RestoreAlreadyReleasedError reports that the active tip already restores TargetSha and its
+// promotion-history note already carries Promoter-restore-unblocked-at. The note is left unchanged
+// and nothing is written. The RestoreActiveCommit controller deletes the object on this error:
+// retrying cannot restore, and a pending object blocks promotion.
+type RestoreAlreadyReleasedError struct {
+	ActiveTip string
+	TargetSha string
+}
+
+// Error implements the error interface for RestoreAlreadyReleasedError.
+func (e *RestoreAlreadyReleasedError) Error() string {
+	return fmt.Sprintf("active tip %q already restores %q and carries %s; it cannot be restored again until the active branch moves", e.ActiveTip, e.TargetSha, constants.TrailerRestoreUnblockedAt)
 }
 
 // hasRestoreMarker reports whether sha carries Promoter-restored-from: targetSha, read from its

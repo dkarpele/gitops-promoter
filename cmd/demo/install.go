@@ -21,8 +21,8 @@ import (
 const ARGOCDURL = "https://raw.githubusercontent.com/argoproj/argo-cd/%s/manifests/install-with-hydrator.yaml"
 
 // PROMOTERURL is the GitOps Promoter release URL template. The demo installs the
-// controller-only bundle (the dashboard UI is surfaced via the Argo CD extension).
-const PROMOTERURL = "https://github.com/argoproj-labs/gitops-promoter/releases/download/%s/install-without-ui.yaml"
+// default bundle: the controller plus the dashboard aggregation API with built-in serving certs.
+const PROMOTERURL = "https://github.com/argoproj-labs/gitops-promoter/releases/download/%s/install-with-dashboard.yaml"
 
 //go:embed app/app.yaml
 var appYAML []byte
@@ -217,26 +217,6 @@ func (i *Installer) RefreshApp(ctx context.Context, appName string) error {
 	}
 
 	color.Green("Application %s refreshed ✓", appName)
-	return nil
-}
-
-// RefreshAllApps refreshes all ArgoCD applications in the argocd namespace
-func (i *Installer) RefreshAllApps(ctx context.Context) error {
-	// Get all application names
-	cmd := exec.CommandContext(ctx, "kubectl", "get", "applications", "-n",
-		"argocd", "-o", "jsonpath={.items[*].metadata.name}")
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to list applications: %w", err)
-	}
-
-	appNames := strings.FieldsSeq(string(output))
-	for appName := range appNames {
-		if err := i.RefreshApp(ctx, appName); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 

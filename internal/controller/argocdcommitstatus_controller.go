@@ -510,6 +510,11 @@ func (r *ArgoCDCommitStatusReconciler) SetupWithManager(ctx context.Context, mcM
 	// Set the local client for interacting with manager cluster
 	r.localClient = mcMgr.GetLocalManager().GetClient()
 
+	// CleanupOrphanedCommitStatuses lists CommitStatuses by their controller owner.
+	if err := utils.RegisterControllerOwnerUIDFieldIndex(ctx, mcMgr.GetLocalManager().GetFieldIndexer(), &promoterv1alpha1.CommitStatus{}); err != nil {
+		return fmt.Errorf("ArgoCDCommitStatus controller: %w", err)
+	}
+
 	// Use Direct methods to read configuration from the API server without cache during setup.
 	// The cache is not started during SetupWithManager, so we must use the non-cached API reader.
 	rateLimiter, err := settings.GetRateLimiterDirect[promoterv1alpha1.ArgoCDCommitStatusConfiguration, mcreconcile.Request](ctx, r.SettingsMgr)
@@ -773,7 +778,7 @@ func (r *ArgoCDCommitStatusReconciler) getGitAuthProvider(ctx context.Context, a
 		return nil, promoterv1alpha1.ObjectReference{}, fmt.Errorf("failed to get PromotionStrategy from ArgoCDCommitStatus %s: %w", argoCDCommitStatus.Name, err)
 	}
 
-	scmProvider, secret, err := utils.GetScmProviderAndSecretFromRepositoryReference(ctx, r.localClient, r.SettingsMgr.GetControllerNamespace(), ps.Spec.RepositoryReference, &ps)
+	scmProvider, secret, err := utils.GetScmProviderAndSecretFromRepositoryReference(ctx, r.localClient, r.SettingsMgr, ps.Spec.RepositoryReference, &ps)
 	if err != nil {
 		return nil, ps.Spec.RepositoryReference, fmt.Errorf("failed to get ScmProvider and secret for PromotionStrategy %q: %w", ps.Name, err)
 	}

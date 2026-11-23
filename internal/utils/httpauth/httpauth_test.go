@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -31,7 +32,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	promoterv1alpha1 "github.com/argoproj-labs/gitops-promoter/api/v1alpha1"
 	"github.com/argoproj-labs/gitops-promoter/internal/utils"
@@ -213,6 +213,8 @@ var _ = Describe("BuildTLSClient", func() {
 	var certPEM, keyPEM []byte
 
 	BeforeEach(func() {
+		utils.ResetProcessTLSSettingsForTest()
+
 		key, err := rsa.GenerateKey(rand.Reader, 2048)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -230,6 +232,10 @@ var _ = Describe("BuildTLSClient", func() {
 		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	})
 
+	AfterEach(func() {
+		utils.ResetProcessTLSSettingsForTest()
+	})
+
 	It("builds an HTTP client with TLS config from secret", func() {
 		secret := &corev1.Secret{
 			Name: "tls-secret",
@@ -244,6 +250,30 @@ var _ = Describe("BuildTLSClient", func() {
 		Expect(client).NotTo(BeNil())
 		Expect(client.Transport).NotTo(BeNil())
 		Expect(client.Timeout).To(Equal(10 * time.Second))
+	})
+
+	It("applies process-wide TLS policy to the client transport", func() {
+		_, err := utils.SetProcessTLSSettings(utils.TLSSettings{
+			MinVersion:       "VersionTLS13",
+			CurvePreferences: []int32{int32(tls.X25519)},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		secret := &corev1.Secret{
+			Name: "tls-secret",
+			Data: map[string][]byte{
+				httpauth.TLSCertKey: certPEM,
+				httpauth.TLSKeyKey:  keyPEM,
+			},
+		}
+
+		client, err := httpauth.BuildTLSClient(context.Background(), secret, 10*time.Second)
+		Expect(err).NotTo(HaveOccurred())
+		transport, ok := client.Transport.(*http.Transport)
+		Expect(ok).To(BeTrue())
+		Expect(transport.TLSClientConfig).NotTo(BeNil())
+		Expect(transport.TLSClientConfig.MinVersion).To(Equal(uint16(tls.VersionTLS13)))
+		Expect(transport.TLSClientConfig.CurvePreferences).To(Equal([]tls.CurveID{tls.X25519}))
 	})
 
 	It("includes RootCAs when ca.crt is present in secret", func() {
@@ -282,171 +312,6 @@ var _ = Describe("BuildTLSClient", func() {
 		_, err := httpauth.BuildTLSClient(context.Background(), secret, time.Second)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("private key"))
-	})
-})
-
-var _ = Describe("ApplyBasicAuthFromSecret", func() {
-	It("fetches the secret and applies Basic auth to the request", func() {
-		secret := &corev1.Secret{
-			Name: "basic-creds", Namespace: "default",
-			Data: map[string][]byte{
-				httpauth.UsernameKey: []byte("from-secret"),
-				httpauth.PasswordKey: []byte("secret-pass"),
-			},
-		}
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyBasicAuthFromSecret(context.Background(), k8sClient, "default", "basic-creds", req)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(req.Header.Get("Authorization")).To(Equal("Basic ZnJvbS1zZWNyZXQ6c2VjcmV0LXBhc3M=")) // base64("from-secret:secret-pass")
-	})
-
-	It("returns an error when the secret does not exist", func() {
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyBasicAuthFromSecret(context.Background(), k8sClient, "default", "missing-secret", req)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("basic auth secret"))
-		Expect(err.Error()).To(ContainSubstring("missing-secret"))
-	})
-})
-
-var _ = Describe("ApplyBearerAuthFromSecret", func() {
-	It("fetches the secret and applies Bearer auth to the request", func() {
-		secret := &corev1.Secret{
-			Name: "api-token", Namespace: "default",
-			Data: map[string][]byte{httpauth.TokenKey: []byte("fetched-bearer-token")},
-		}
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyBearerAuthFromSecret(context.Background(), k8sClient, "default", "api-token", req)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(req.Header.Get("Authorization")).To(Equal("Bearer fetched-bearer-token"))
-	})
-
-	It("returns an error when the secret does not exist", func() {
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyBearerAuthFromSecret(context.Background(), k8sClient, "default", "missing", req)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("bearer auth secret"))
-	})
-})
-
-var _ = Describe("ApplyOAuth2AuthFromSecret", func() {
-	var tokenServer *httptest.Server
-
-	BeforeEach(func() {
-		tokenServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"access_token": "from-oauth2-secret",
-				"token_type":   "Bearer",
-				"expires_in":   3600,
-			})
-		}))
-	})
-
-	AfterEach(func() {
-		if tokenServer != nil {
-			tokenServer.Close()
-		}
-	})
-
-	It("fetches the secret and applies OAuth2 auth to the request", func() {
-		secret := &corev1.Secret{
-			Name: "oauth-creds", Namespace: "default",
-			Data: map[string][]byte{
-				httpauth.ClientIDKey:     []byte("oid"),
-				httpauth.ClientSecretKey: []byte("osecret"),
-			},
-		}
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-		config := &httpauth.OAuth2Config{
-			SecretName: "oauth-creds",
-			TokenURL:   tokenServer.URL + "/oauth/token",
-		}
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyOAuth2AuthFromSecret(context.Background(), k8sClient, "default", config, req)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(req.Header.Get("Authorization")).To(Equal("Bearer from-oauth2-secret"))
-	})
-
-	It("returns an error when config is nil", func() {
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyOAuth2AuthFromSecret(context.Background(), k8sClient, "default", nil, req)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("OAuth2 config is required"))
-	})
-
-	It("returns an error when the secret does not exist", func() {
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-		config := &httpauth.OAuth2Config{SecretName: "missing", TokenURL: "https://token.example.com"}
-		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-
-		err := httpauth.ApplyOAuth2AuthFromSecret(context.Background(), k8sClient, "default", config, req)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("OAuth2 secret"))
-	})
-})
-
-var _ = Describe("BuildTLSClientFromSecret", func() {
-	var certPEM, keyPEM []byte
-
-	BeforeEach(func() {
-		key, err := rsa.GenerateKey(rand.Reader, 2048)
-		Expect(err).NotTo(HaveOccurred())
-		template := &x509.Certificate{
-			SerialNumber: big.NewInt(1),
-			NotBefore:    time.Now(),
-			NotAfter:     time.Now().Add(24 * time.Hour),
-			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		}
-		certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-		Expect(err).NotTo(HaveOccurred())
-		certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	})
-
-	It("fetches the secret and builds a TLS client", func() {
-		secret := &corev1.Secret{
-			Name: "client-cert", Namespace: "default",
-			Data: map[string][]byte{
-				httpauth.TLSCertKey: certPEM,
-				httpauth.TLSKeyKey:  keyPEM,
-			},
-		}
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-
-		client, err := httpauth.BuildTLSClientFromSecret(context.Background(), k8sClient, "default", "client-cert", 15*time.Second)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(client).NotTo(BeNil())
-		Expect(client.Timeout).To(Equal(15 * time.Second))
-	})
-
-	It("returns an error when the secret does not exist", func() {
-		scheme := utils.GetScheme()
-		k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-		_, err := httpauth.BuildTLSClientFromSecret(context.Background(), k8sClient, "default", "missing-tls-secret", time.Second)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("TLS secret"))
-		Expect(err.Error()).To(ContainSubstring("missing-tls-secret"))
 	})
 })
 

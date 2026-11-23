@@ -45,12 +45,20 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.AzureDevOpsApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("AzureDevOpsRepo"):
 		return &apiv1alpha1.AzureDevOpsRepoApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("AzureWorkloadIdentity"):
+		return &apiv1alpha1.AzureWorkloadIdentityApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("BasicAuth"):
 		return &apiv1alpha1.BasicAuthApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("BearerAuth"):
 		return &apiv1alpha1.BearerAuthApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("BitbucketCloud"):
+		return &apiv1alpha1.BitbucketCloudApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("BitbucketCloudRepo"):
 		return &apiv1alpha1.BitbucketCloudRepoApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("BitbucketDataCenter"):
+		return &apiv1alpha1.BitbucketDataCenterApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("BitbucketDataCenterRepo"):
+		return &apiv1alpha1.BitbucketDataCenterRepoApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("Bucket"):
 		return &apiv1alpha1.BucketApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ChangeRequestPolicyCommitStatusPhase"):
@@ -71,8 +79,14 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.ChangeTransferPolicySpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ChangeTransferPolicyStatus"):
 		return &apiv1alpha1.ChangeTransferPolicyStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ClusterAzureDevOps"):
+		return &apiv1alpha1.ClusterAzureDevOpsApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ClusterScmProvider"):
 		return &apiv1alpha1.ClusterScmProviderApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ClusterScmProviderConfiguration"):
+		return &apiv1alpha1.ClusterScmProviderConfigurationApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ClusterScmProviderSpec"):
+		return &apiv1alpha1.ClusterScmProviderSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("CommitBranchState"):
 		return &apiv1alpha1.CommitBranchStateApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("CommitBranchStateHistoryProposed"):
@@ -171,6 +185,10 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.HTTPRequestVariablesSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("HydratorMetadata"):
 		return &apiv1alpha1.HydratorMetadataApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("MetricsConfiguration"):
+		return &apiv1alpha1.MetricsConfigurationApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("MetricsLabelsConfiguration"):
+		return &apiv1alpha1.MetricsLabelsConfigurationApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ModeSpec"):
 		return &apiv1alpha1.ModeSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("OAuth2Auth"):
@@ -241,6 +259,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.ScmProviderObjectReferenceApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ScmProviderSpec"):
 		return &apiv1alpha1.ScmProviderSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ScmProviderSpecCommon"):
+		return &apiv1alpha1.ScmProviderSpecCommonApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ScmProviderStatus"):
 		return &apiv1alpha1.ScmProviderStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SuccessSpec"):

@@ -34,11 +34,17 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	"github.com/argoproj-labs/gitops-promoter/internal/settings"
+	promoterConditions "github.com/argoproj-labs/gitops-promoter/internal/types/conditions"
 	"github.com/argoproj-labs/gitops-promoter/internal/types/constants"
 	"github.com/argoproj-labs/gitops-promoter/internal/utils"
+	"github.com/argoproj-labs/gitops-promoter/internal/webrequest"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	promoterv1alpha1 "github.com/argoproj-labs/gitops-promoter/api/v1alpha1"
@@ -286,7 +292,7 @@ var _ = Describe("WebRequestCommitStatus Controller", Ordered, func() {
 			Eventually(func(g Gomega) {
 				var eventList corev1.EventList
 				g.Expect(k8sClient.List(ctx, &eventList, ctrlclient.InNamespace("default"))).To(Succeed())
-				g.Expect(hasEventWithReasonAndMessage(eventList, name+"-polling-success", constants.CommitStatusPhaseChangedReason, "to success")).To(BeTrue())
+				expectEventEmitted(g, hasEventWithReasonAndMessage(eventList, name+"-polling-success", constants.CommitStatusPhaseChangedReason, "to success"))
 			}, constants.EventuallyTimeout).Should(Succeed())
 		})
 	})
@@ -403,9 +409,16 @@ var _ = Describe("WebRequestCommitStatus Controller", Ordered, func() {
 
 		It("should emit a WebRequestFailed event when the HTTP request cannot be made", func() {
 			Eventually(func(g Gomega) {
+				var fetched promoterv1alpha1.WebRequestCommitStatus
+				g.Expect(k8sClient.Get(ctx, ctrlclient.ObjectKeyFromObject(webRequestCommitStatus), &fetched)).To(Succeed())
+				ready := meta.FindStatusCondition(fetched.Status.Conditions, string(promoterConditions.Ready))
+				g.Expect(ready).NotTo(BeNil())
+				g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(ready.Message).To(ContainSubstring("failed to make HTTP request"))
+
 				var eventList corev1.EventList
 				g.Expect(k8sClient.List(ctx, &eventList, ctrlclient.InNamespace("default"))).To(Succeed())
-				g.Expect(hasEventWithReason(eventList, name+"-unreachable-url", constants.WebRequestFailedReason)).To(BeTrue())
+				expectEventEmitted(g, hasEventWithReason(eventList, name+"-unreachable-url", constants.WebRequestFailedReason))
 			}, constants.EventuallyTimeout).Should(Succeed())
 		})
 	})
@@ -1728,6 +1741,7 @@ var _ = Describe("WebRequestCommitStatus Controller - ResponseOutput", Ordered, 
 
 			By("Waiting for first request and response data")
 			var firstResponseData []byte
+			var requestsBeforePersist int
 			Eventually(func(g Gomega) {
 				var wrcs promoterv1alpha1.WebRequestCommitStatus
 				err := k8sClient.Get(ctx, types.NamespacedName{
@@ -1738,7 +1752,20 @@ var _ = Describe("WebRequestCommitStatus Controller - ResponseOutput", Ordered, 
 				g.Expect(wrcs.Status.Environments).ToNot(BeEmpty())
 				g.Expect(wrcs.Status.Environments[0].ResponseOutput).NotTo(BeNil())
 				firstResponseData = wrcs.Status.Environments[0].ResponseOutput.Raw
+				// Snapshot after the status read: the request that produced this status has already
+				// been counted, and no later reconcile fires once triggerOutput is persisted.
+				mu.Lock()
+				requestsBeforePersist = requestCount
+				mu.Unlock()
 			}, constants.EventuallyTimeout).Should(Succeed())
+
+			// WebRequestCommitStatus delivery is at-least-once (see the web-request-commit-status docs):
+			// if the status apply after a request fails, triggerOutput is not persisted and the next
+			// reconcile re-sends. Injected Kubernetes write faults do exactly that, so only assert a
+			// single request when faults are off.
+			if !faultsInjected {
+				Expect(requestsBeforePersist).To(Equal(1), "Should only make one request")
+			}
 
 			By("Verifying response data is preserved on subsequent reconciles")
 			Consistently(func(g Gomega) {
@@ -1756,7 +1783,7 @@ var _ = Describe("WebRequestCommitStatus Controller - ResponseOutput", Ordered, 
 				mu.Lock()
 				c := requestCount
 				mu.Unlock()
-				g.Expect(c).To(Equal(1), "Should only make one request")
+				g.Expect(c).To(Equal(requestsBeforePersist), "Should make no further requests once triggerOutput is persisted")
 			}, 15*time.Second, 3*time.Second).Should(Succeed())
 		})
 
@@ -2021,7 +2048,7 @@ var _ = Describe("WebRequestCommitStatus Controller - ResponseOutput", Ordered, 
 		})
 	})
 
-	Describe("Scm - use PromotionStrategy SCM credentials", func() {
+	Describe("Scm - use PromotionStrategy SCM credentials", Label(fakeSCMOnlyLabel), func() {
 		var (
 			scmAuthCtx               context.Context
 			scmAuthName              string
@@ -2242,7 +2269,7 @@ var _ = Describe("WebRequestCommitStatus Controller - SCM Host Validation", func
 		wrcs              *promoterv1alpha1.WebRequestCommitStatus
 	)
 
-	Context("when the URL host matches the SCM provider domain", func() {
+	Context("when the URL host matches the SCM provider domain", Label(fakeSCMOnlyLabel), func() {
 		BeforeEach(func() {
 			ctx = context.Background()
 			testServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2354,7 +2381,7 @@ var _ = Describe("WebRequestCommitStatus Controller - SCM Host Validation", func
 		})
 	})
 
-	Context("when the URL host does not match the SCM provider domain", func() {
+	Context("when the URL host does not match the SCM provider domain", Label(fakeSCMOnlyLabel), func() {
 		BeforeEach(func() {
 			ctx = context.Background()
 			By("Creating unique SCM resources with Fake domain that does not match the test server")
@@ -2456,6 +2483,130 @@ var _ = Describe("WebRequestCommitStatus Controller - SCM Host Validation", func
 				g.Expect(readyCondition).ToNot(BeNil(), "Ready condition should be set")
 				g.Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
 				g.Expect(readyCondition.Message).To(ContainSubstring("SCM host validation failed"))
+			}, constants.EventuallyTimeout).Should(Succeed())
+		})
+	})
+})
+
+// Secret opt-in tests: a Secret named by httpRequest.authentication must carry
+// promoter.argoproj.io/webrequestcommitstatus-access=allowed before the controller reads it. Each test uses unique resources (via promotionStrategyResource).
+var _ = Describe("WebRequestCommitStatus Controller - Secret opt-in", func() {
+	var (
+		ctx               context.Context
+		name              string
+		scmSecret         *corev1.Secret
+		scmProvider       *promoterv1alpha1.ScmProvider
+		gitRepo           *promoterv1alpha1.GitRepository
+		promotionStrategy *promoterv1alpha1.PromotionStrategy
+		testServer        *httptest.Server
+		wrcs              *promoterv1alpha1.WebRequestCommitStatus
+		authSecret        *corev1.Secret
+	)
+
+	Context("when the referenced Secret lacks the opt-in label", Label(fakeSCMOnlyLabel), func() {
+		BeforeEach(func() {
+			ctx = context.Background()
+			testServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{"approved": true})
+			}))
+
+			name, scmSecret, scmProvider, gitRepo, _, _, promotionStrategy = promotionStrategyResource(ctx, "wrcs-secret-opt-in", "default")
+			promotionStrategy.Spec.Environments = []promoterv1alpha1.Environment{{Branch: testBranchDevelopment}}
+			promotionStrategy.Spec.ProposedCommitStatuses = []promoterv1alpha1.CommitStatusSelector{{Key: "secret-opt-in"}}
+			setupInitialTestGitRepoOnServer(ctx, gitRepo)
+			Expect(k8sClient.Create(ctx, scmSecret)).To(Succeed())
+			Expect(k8sClient.Create(ctx, scmProvider)).To(Succeed())
+			Expect(k8sClient.Create(ctx, gitRepo)).To(Succeed())
+			declareDependentsSuccessfulGate(promotionStrategy)
+			Expect(k8sClient.Create(ctx, promotionStrategy)).To(Succeed())
+			createDependentsSuccessfulCommitStatus(ctx, promotionStrategy)
+
+			authSecret = &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-bearer", Namespace: "default"},
+				StringData: map[string]string{"token": "bearer-token"},
+			}
+			Expect(k8sClient.Create(ctx, authSecret)).To(Succeed())
+
+			wrcs = &promoterv1alpha1.WebRequestCommitStatus{
+				Name:      name + "-opt-in",
+				Namespace: "default",
+				Spec: promoterv1alpha1.WebRequestCommitStatusSpec{
+					PromotionStrategyRef: promoterv1alpha1.ObjectReference{Name: name},
+					Key:                  "secret-opt-in",
+					ReportOn:             constants.CommitRefProposed,
+					HTTPRequest: promoterv1alpha1.HTTPRequestSpec{
+						URLTemplate:    testServer.URL + "/validate",
+						MethodTemplate: "GET",
+						Timeout:        metav1.Duration{Duration: 10 * time.Second},
+						Authentication: &promoterv1alpha1.HTTPAuthentication{
+							Bearer: &promoterv1alpha1.BearerAuth{SecretRef: &corev1.LocalObjectReference{Name: authSecret.Name}},
+						},
+					},
+					Success: promoterv1alpha1.SuccessSpec{
+						When: promoterv1alpha1.WhenWithOutputSpec{
+							Expression: `Response != nil ? (Response.StatusCode == 200 && Response.Body.approved == true) : Phase == "success"`,
+						},
+					},
+					Mode: promoterv1alpha1.ModeSpec{
+						Polling: &promoterv1alpha1.PollingModeSpec{Interval: metav1.Duration{Duration: 5 * time.Second}},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wrcs)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			if testServer != nil {
+				testServer.Close()
+				testServer = nil
+			}
+			for _, obj := range []ctrlclient.Object{wrcs, promotionStrategy, gitRepo, scmProvider, scmSecret, authSecret} {
+				if obj != nil {
+					_ = ctrlclient.IgnoreNotFound(k8sClient.Delete(ctx, obj))
+				}
+			}
+			wrcs, promotionStrategy, gitRepo, scmProvider, scmSecret, authSecret = nil, nil, nil, nil, nil, nil
+		})
+
+		It("refuses an unlabeled Secret and proceeds once the Secret is labeled", func() {
+			By("Expecting the WRCS to report Ready=False naming the opt-in label")
+			Eventually(func(g Gomega) {
+				var fetched promoterv1alpha1.WebRequestCommitStatus
+				g.Expect(k8sClient.Get(ctx, ctrlclient.ObjectKeyFromObject(wrcs), &fetched)).To(Succeed())
+				ready := meta.FindStatusCondition(fetched.Status.Conditions, string(promoterConditions.Ready))
+				g.Expect(ready).NotTo(BeNil())
+				g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(ready.Message).To(ContainSubstring(promoterv1alpha1.WebRequestCommitStatusAccessLabel))
+				g.Expect(fetched.Status.Environments).To(BeEmpty())
+			}, constants.EventuallyTimeout).Should(Succeed())
+
+			By("Labeling the Secret")
+			Eventually(func(g Gomega) {
+				var s corev1.Secret
+				g.Expect(k8sClient.Get(ctx, ctrlclient.ObjectKeyFromObject(authSecret), &s)).To(Succeed())
+				if s.Labels == nil {
+					s.Labels = map[string]string{}
+				}
+				s.Labels[promoterv1alpha1.WebRequestCommitStatusAccessLabel] = string(promoterv1alpha1.AccessAllowed)
+				g.Expect(k8sClient.Update(ctx, &s)).To(Succeed())
+			}, constants.EventuallyTimeout).Should(Succeed())
+
+			By("Bumping the WRCS spec so it reconciles now instead of after the failure backoff")
+			Eventually(func(g Gomega) {
+				var fetched promoterv1alpha1.WebRequestCommitStatus
+				g.Expect(k8sClient.Get(ctx, ctrlclient.ObjectKeyFromObject(wrcs), &fetched)).To(Succeed())
+				fetched.Spec.HTTPRequest.Timeout = metav1.Duration{Duration: 11 * time.Second}
+				g.Expect(k8sClient.Update(ctx, &fetched)).To(Succeed())
+			}, constants.EventuallyTimeout).Should(Succeed())
+
+			By("Expecting the WRCS to make the request and reach success")
+			Eventually(func(g Gomega) {
+				var fetched promoterv1alpha1.WebRequestCommitStatus
+				g.Expect(k8sClient.Get(ctx, ctrlclient.ObjectKeyFromObject(wrcs), &fetched)).To(Succeed())
+				g.Expect(fetched.Status.Environments).To(HaveLen(1))
+				g.Expect(fetched.Status.Environments[0].Phase).To(Equal(promoterv1alpha1.CommitPhaseSuccess))
 			}, constants.EventuallyTimeout).Should(Succeed())
 		})
 	})
@@ -4657,3 +4808,53 @@ func wrcsPhaseForBranch(items []promoterv1alpha1.WebRequestCommitStatusPhasePerB
 	}
 	return ""
 }
+
+var _ = Describe("WebRequestCommitStatus namespace metadata", func() {
+	const controllerNamespace = "promoter-system"
+
+	newReconciler := func(mode promoterv1alpha1.FeatureMode, namespaceGets *int) *WebRequestCommitStatusReconciler {
+		cc := &promoterv1alpha1.ControllerConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: settings.ControllerConfigurationName, Namespace: controllerNamespace},
+		}
+		cc.Spec.WebRequestCommitStatus.NamespaceMetadata = mode
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:        "team-a",
+			Labels:      map[string]string{"team": "payments"},
+			Annotations: map[string]string{"cost-center": "42"},
+		}}
+		c := fake.NewClientBuilder().WithScheme(utils.GetScheme()).WithObjects(cc, ns).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c ctrlclient.WithWatch, key ctrlclient.ObjectKey, obj ctrlclient.Object, opts ...ctrlclient.GetOption) error {
+					if _, ok := obj.(*corev1.Namespace); ok {
+						*namespaceGets++
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}).Build()
+		return &WebRequestCommitStatusReconciler{
+			Client:      c,
+			SettingsMgr: settings.NewManager(c, c, settings.ManagerConfig{ControllerNamespace: controllerNamespace}),
+		}
+	}
+
+	It("reads the Namespace when namespace metadata is enabled", func() {
+		gets := 0
+		r := newReconciler(promoterv1alpha1.FeatureModeEnabled, &gets)
+
+		meta, err := r.getNamespaceMetadata(context.Background(), "team-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(meta.Labels).To(HaveKeyWithValue("team", "payments"))
+		Expect(meta.Annotations).To(HaveKeyWithValue("cost-center", "42"))
+		Expect(gets).To(Equal(1))
+	})
+
+	It("returns empty metadata without reading the Namespace when namespace metadata is disabled", func() {
+		gets := 0
+		r := newReconciler(promoterv1alpha1.FeatureModeDisabled, &gets)
+
+		meta, err := r.getNamespaceMetadata(context.Background(), "team-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(meta).To(Equal(webrequest.NamespaceMetadata{}))
+		Expect(gets).To(Equal(0))
+	})
+})

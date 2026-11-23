@@ -102,6 +102,94 @@ type ControllerConfigurationSpec struct {
 	// including WorkQueue settings that control reconciliation behavior.
 	// +required
 	RestoreActiveCommit RestoreActiveCommitConfiguration `json:"restoreActiveCommit"`
+
+	// ClusterScmProvider contains the configuration for ClusterScmProvider support.
+	// +optional
+	// +kubebuilder:default={}
+	ClusterScmProvider ClusterScmProviderConfiguration `json:"clusterScmProvider,omitzero"`
+
+	// Scope limits watches of namespaced resources: Cluster (all namespaces) or Namespace (controller namespace only).
+	// Requires a controller restart.
+	// +optional
+	// +kubebuilder:default=Cluster
+	Scope ControllerScope `json:"scope,omitempty"`
+
+	// Metrics contains the configuration for the controller's Prometheus metrics.
+	// +optional
+	// +kubebuilder:default={}
+	Metrics MetricsConfiguration `json:"metrics,omitzero"`
+}
+
+// MetricsConfiguration defines the configuration for the controller's Prometheus metrics.
+type MetricsConfiguration struct {
+	// Labels controls which metrics carry selected Prometheus labels (not Kubernetes labels).
+	// +optional
+	// +kubebuilder:default={}
+	Labels MetricsLabelsConfiguration `json:"labels,omitzero"`
+}
+
+// MetricsLabelsConfiguration selects which metrics carry each configurable Prometheus label.
+type MetricsLabelsConfiguration struct {
+	// GitRepository controls which of git_operations_total, git_operations_duration_seconds,
+	// scm_calls_total, and scm_calls_duration_seconds set the git_repository and
+	// git_repository_namespace labels. These labels multiply series by the number of GitRepositories,
+	// and histograms multiply them again by their bucket count. The scm_calls_rate_limit_* gauges
+	// never carry these labels.
+	// Where a metric doesn't set the labels, the label names remain with empty values, aggregating
+	// series across repositories.
+	// All: all four metrics set the labels.
+	// Counters: only the two _total counters set them, so percentiles from the _duration_seconds
+	// histograms stay available at much lower cardinality.
+	// None: none of the four metrics set them.
+	// Changing this value resets the affected metrics.
+	// +optional
+	// +kubebuilder:default=All
+	GitRepository MetricLabelMode `json:"gitRepository,omitempty"`
+}
+
+// MetricLabelMode selects which of the affected metrics set a Prometheus label's value. Metrics that
+// don't set it keep the label name with an empty value.
+// +kubebuilder:validation:Enum=All;Counters;None
+type MetricLabelMode string
+
+const (
+	// MetricLabelModeAll sets the label's value on every affected metric.
+	MetricLabelModeAll MetricLabelMode = "All"
+	// MetricLabelModeCounters sets the label's value only on the affected counters and leaves it empty on the others.
+	MetricLabelModeCounters MetricLabelMode = "Counters"
+	// MetricLabelModeNone leaves the label's value empty on every affected metric.
+	MetricLabelModeNone MetricLabelMode = "None"
+)
+
+// ControllerScope is the scope of namespaced resources the controller watches.
+// +kubebuilder:validation:Enum=Cluster;Namespace
+type ControllerScope string
+
+const (
+	// ControllerScopeCluster watches namespaced resources in all namespaces.
+	ControllerScopeCluster ControllerScope = "Cluster"
+	// ControllerScopeNamespace watches namespaced resources only in the controller install namespace.
+	ControllerScopeNamespace ControllerScope = "Namespace"
+)
+
+// FeatureMode enables or disables a controller feature.
+// +kubebuilder:validation:Enum=Enabled;Disabled
+type FeatureMode string
+
+const (
+	// FeatureModeEnabled enables the feature.
+	FeatureModeEnabled FeatureMode = "Enabled"
+	// FeatureModeDisabled disables the feature.
+	FeatureModeDisabled FeatureMode = "Disabled"
+)
+
+// ClusterScmProviderConfiguration defines the configuration for ClusterScmProvider support.
+type ClusterScmProviderConfiguration struct {
+	// Mode enables or disables ClusterScmProvider support. When Disabled, ClusterScmProviders are not watched
+	// and references to them fail. Requires a controller restart.
+	// +optional
+	// +kubebuilder:default=Enabled
+	Mode FeatureMode `json:"mode,omitempty"`
 }
 
 // PromotionStrategyConfiguration defines the configuration for the PromotionStrategy controller.
@@ -142,8 +230,8 @@ type ChangeTransferPolicyConfiguration struct {
 // This configuration controls how the PullRequest controller processes reconciliation requests
 // and generates pull requests, including WorkQueue settings and template configuration.
 type PullRequestConfiguration struct {
-	// Template is the template configuration used to generate pull request titles and descriptions.
-	// Uses Go template syntax with Sprig functions available.
+	// Template is the template configuration used to generate pull request titles, descriptions,
+	// and merge commit messages. Uses Go template syntax with Sprig functions available.
 	// +required
 	Template PullRequestTemplate `json:"template"`
 
@@ -225,6 +313,13 @@ type WebRequestCommitStatusConfiguration struct {
 	// This includes requeue duration, maximum concurrent reconciles, and rate limiter settings.
 	// +required
 	WorkQueue WorkQueue `json:"workQueue"`
+
+	// NamespaceMetadata enables or disables reading the Namespace for NamespaceMetadata in templates and expressions.
+	// When Disabled, Namespaces are not watched and NamespaceMetadata is empty.
+	// Requires a controller restart.
+	// +optional
+	// +kubebuilder:default=Enabled
+	NamespaceMetadata FeatureMode `json:"namespaceMetadata,omitempty"`
 }
 
 // ScheduledCommitStatusConfiguration defines the configuration for the ScheduledCommitStatus controller.
@@ -308,7 +403,7 @@ type ExponentialFailure struct {
 // Exactly one of the rate limiter types or MaxOf must be specified.
 //
 // See https://pkg.go.dev/k8s.io/client-go/util/workqueue for rate limiter implementation details.
-// +kubebuilder:validation:AtMostOneOf=fastSlow;exponentialFailure;bucket;maxOf
+// +kubebuilder:validation:ExactlyOneOf=fastSlow;exponentialFailure;bucket;maxOf
 type RateLimiter struct {
 	// RateLimiterTypes can be one of: FastSlow, ExponentialFailure, or Bucket.
 	// +optional
@@ -318,7 +413,9 @@ type RateLimiter struct {
 	// limiters is used. This enables sophisticated rate limiting that respects multiple
 	// constraints simultaneously (e.g., both per-item exponential backoff and global rate limits).
 	// +optional
+	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:XValidation:rule="(has(self.fastSlow)?1:0)+(has(self.exponentialFailure)?1:0)+(has(self.bucket)?1:0) == 1",message="exactly one of fastSlow, exponentialFailure or bucket must be specified"
 	MaxOf []RateLimiterTypes `json:"maxOf,omitempty"`
 }
 
@@ -402,6 +499,11 @@ type Bucket struct {
 // Templates use Go template syntax and have access to Sprig functions for flexible string
 // manipulation and formatting.
 //
+// The CommitMessage template is the whole human-readable merge commit message; the title and
+// description are never used in its place. Commit trailers required by the promoter are appended
+// automatically after the rendered message. When the template renders empty and trailers are
+// appended, a minimal "Promote to `<branch>`" subject is added so git can still parse the trailers.
+//
 // Template data available when rendering (used by the ChangeTransferPolicy controller when creating/updating PRs):
 //   - .ChangeTransferPolicy – the ChangeTransferPolicy for the managing this PullRequest
 //   - .PromotionStrategy – the PromotionStrategy for the CTP
@@ -415,6 +517,16 @@ type PullRequestTemplate struct {
 	// Uses Go template syntax with Sprig functions available for string manipulation.
 	// +required
 	Description string `json:"description"`
+
+	// CommitMessage is the template used to generate the merge commit message for the pull request.
+	// The rendered template is the whole human-readable message; the title and description are never
+	// used in its place. Machine-read commit trailers used by the promoter to reconstruct promotion
+	// history are always appended after the rendered message; do not attempt to include them in the template.
+	// When the template renders empty and trailers are appended, a minimal "Promote to `<branch>`"
+	// subject is added, because git does not parse trailers from the first paragraph of a message.
+	// Uses Go template syntax with Sprig functions available for string manipulation.
+	// +required
+	CommitMessage string `json:"commitMessage"`
 }
 
 // ControllerConfigurationStatus defines the observed state of ControllerConfiguration.

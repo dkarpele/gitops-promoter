@@ -22,9 +22,11 @@ import (
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	bitbucket_cloud "github.com/argoproj-labs/gitops-promoter/internal/scms/bitbucket_cloud"
+	bitbucket_datacenter "github.com/argoproj-labs/gitops-promoter/internal/scms/bitbucket_datacenter"
 	"github.com/argoproj-labs/gitops-promoter/internal/scms/fake"
 	"github.com/argoproj-labs/gitops-promoter/internal/scms/forgejo"
 	"github.com/argoproj-labs/gitops-promoter/internal/scms/gitea"
@@ -141,8 +143,21 @@ func (r *CommitStatusReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CommitStatusReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
-	err := ctrl.NewControllerManagedBy(mgr).
+	// Use Direct methods to read configuration from the API server without cache during setup.
+	// The cache is not started during SetupWithManager, so we must use the non-cached API reader.
+	rateLimiter, err := settings.GetRateLimiterDirect[promoterv1alpha1.CommitStatusConfiguration, ctrl.Request](ctx, r.SettingsMgr)
+	if err != nil {
+		return fmt.Errorf("failed to get CommitStatus rate limiter: %w", err)
+	}
+
+	maxConcurrentReconciles, err := settings.GetMaxConcurrentReconcilesDirect[promoterv1alpha1.CommitStatusConfiguration](ctx, r.SettingsMgr)
+	if err != nil {
+		return fmt.Errorf("failed to get CommitStatus max concurrent reconciles: %w", err)
+	}
+
+	err = ctrl.NewControllerManagedBy(mgr).
 		For(&promoterv1alpha1.CommitStatus{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles, RateLimiter: rateLimiter}).
 		Complete(r)
 	if err != nil {
 		return fmt.Errorf("failed to create controller: %w", err)
@@ -151,7 +166,7 @@ func (r *CommitStatusReconciler) SetupWithManager(ctx context.Context, mgr ctrl.
 }
 
 func (r *CommitStatusReconciler) getCommitStatusProvider(ctx context.Context, commitStatus promoterv1alpha1.CommitStatus) (scms.CommitStatusProvider, error) {
-	scmProvider, secret, err := utils.GetScmProviderAndSecretFromRepositoryReference(ctx, r.Client, r.SettingsMgr.GetControllerNamespace(), commitStatus.Spec.RepositoryReference, &commitStatus)
+	scmProvider, secret, err := utils.GetScmProviderAndSecretFromRepositoryReference(ctx, r.Client, r.SettingsMgr, commitStatus.Spec.RepositoryReference, &commitStatus)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ScmProvider and secret for repo %q: %w", commitStatus.Spec.RepositoryReference.Name, err)
 	}
@@ -178,9 +193,16 @@ func (r *CommitStatusReconciler) getCommitStatusProvider(ctx context.Context, co
 		return p, nil
 	case scmProvider.GetSpec().BitbucketCloud != nil:
 		var p *bitbucket_cloud.CommitStatus
-		p, err = bitbucket_cloud.NewBitbucketCloudCommitStatusProvider(r.Client, *secret)
+		p, err = bitbucket_cloud.NewBitbucketCloudCommitStatusProvider(r.Client, *secret, scmProvider.GetSpec().BitbucketCloud.Domain)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get Bitbucket Cloud provider with secret %q: %w", secret.Name, err)
+		}
+		return p, nil
+	case scmProvider.GetSpec().BitbucketDataCenter != nil:
+		var p *bitbucket_datacenter.CommitStatus
+		p, err = bitbucket_datacenter.NewBitbucketDataCenterCommitStatusProvider(r.Client, scmProvider, *secret)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get Bitbucket DataCenter provider for domain %q with secret %q: %w", scmProvider.GetSpec().BitbucketDataCenter.Domain, secret.Name, err)
 		}
 		return p, nil
 	case scmProvider.GetSpec().Forgejo != nil:
@@ -199,7 +221,7 @@ func (r *CommitStatusReconciler) getCommitStatusProvider(ctx context.Context, co
 		return p, nil
 	case scmProvider.GetSpec().AzureDevOps != nil:
 		var p *azuredevops.CommitStatus
-		p, err = azuredevops.NewAzureDevopsCommitStatusProvider(ctx, r.Client, scmProvider, *secret, scmProvider.GetSpec().AzureDevOps.Organization)
+		p, err = azuredevops.NewAzureDevopsCommitStatusProvider(ctx, r.Client, r.SettingsMgr, scmProvider, *secret, scmProvider.GetSpec().AzureDevOps.Organization)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get Azure DevOps provider for organization %q with secret %q: %w", scmProvider.GetSpec().AzureDevOps.Organization, secret.Name, err)
 		}

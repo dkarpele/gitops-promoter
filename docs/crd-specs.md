@@ -125,6 +125,8 @@ auth mechanism.
 
 A ClusterScmProvider represents a SCM instance (such as GitHub). ClusterScmProvider is the cluster-scoped alternative to the ScmProvider. It references a Secret in the same namespace where the promoter is running to enable access via some configured
 auth mechanism. A ClusterScmProvider can be referenced by any GitRepository in the cluster, regardless of namespace.
+For Azure DevOps it can instead authenticate with the controller's Azure workload identity (`azureDevOps.workloadIdentity`),
+which is only supported on ClusterScmProvider because it uses the controller's own credentials.
 
 ```yaml
 {!internal/controller/testdata/ClusterScmProvider.yaml!}
@@ -204,6 +206,16 @@ A ControllerConfiguration is used to configure the behavior of the promoter.
 A global ControllerConfiguration is deployed alongside the controller and applies to all promotions.
 
 All fields are required, but defaults are provided in the installation manifests.
+
+The `pullRequest.template` section controls the title, description, and merge commit message of
+promotion PRs. The `commitMessage` field is the human-readable merge commit message for the
+environment being promoted. The shipped default is plain text, because git log does not render
+Markdown. It describes only that environment (deployment commit and code reference) and does not
+include the promotion pipeline from the PR description. The title and description are never used
+in place of the commit message. Commit trailers used by the promoter to reconstruct promotion
+history are always appended after the rendered message. When the template renders empty and
+trailers are appended, a minimal ``Promote to `<branch>` `` subject is added, because git does
+not parse trailers from the first paragraph of a message.
 
 ```yaml
 {!internal/controller/testdata/ControllerConfiguration.yaml!}

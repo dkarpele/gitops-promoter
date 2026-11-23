@@ -15,7 +15,7 @@ Do **not** skip this for “small” calls: if it hits the provider’s REST API
 
 - Use the `context.Context` passed into your provider method so logging inherits reconcile fields where applicable.
 - Pass the resolved [`GitRepository`](../crd-specs.md) object (same as other providers: load via `utils.GetGitRepositoryFromObjectKey` in `internal/utils/utils.go` or equivalent).
-- Set `api` to `metrics.SCMAPICommitStatus`, `metrics.SCMAPIPullRequest`, or `metrics.SCMAPIProvider` (provider-specific calls outside those Promoter APIs), and `operation` to the closest `metrics.SCMOperation` value in `internal/metrics/metrics.go` (`create`, `update`, `merge`, `close`, `list`, `get`). GitHub-specific provider calls use `metrics.GitHubSCMProviderOperation` instead, for example `list-installations`.
+- Set `api` to `metrics.SCMAPICommitStatus`, `metrics.SCMAPIPullRequest`, or `metrics.SCMAPIProvider` (provider-specific calls outside those Promoter APIs), and `operation` to the closest `metrics.SCMOperation` value in `internal/metrics/metrics.go` (`create`, `update`, `merge`, `close`, `list`, `get`). GitHub-specific provider calls use `metrics.GitHubSCMProviderOperation` instead, for example `get-org-installation`.
 - If the client returns no response on error, map to a sensible status code (existing providers often use `500`) so the metric still has a code label.
 - **GitHub only:** you can pass non-nil `rateLimit` built from the GitHub client’s rate object (see `internal/scms/github/utils.go`); other providers usually pass `nil`.
 
@@ -65,3 +65,8 @@ Pick `metrics.SCMAPICommitStatus`, `SCMAPIPullRequest`, or `SCMAPIProvider` and 
 ## User-facing metrics and docs
 
 If you introduce **new** Prometheus metrics (unusual for a new provider), register them in `internal/metrics/metrics.go` and document them in [Metrics](../monitoring/metrics.md). For `RecordSCMCall`, the existing `scm_calls_*` metrics already cover new providers.
+
+## Testing against the test SCM server
+
+Teach the [test SCM server](test-scm-server.md) the new provider's API and webhook format. Then add the provider to its
+contract, webhook and e2e tables, so the real implementation is exercised end to end in CI.
